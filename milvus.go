@@ -29,8 +29,9 @@ func (m *Module) NewModuleInstance(_ modules.VU) modules.Instance {
 	return &moduleInstance{exports: modules.Exports{
 		Default: factory,
 		Named: map[string]interface{}{
-			"connect":              factory.Connect,
-			"generateFloatVectors": GenerateFloatVectors,
+			"connect":               factory.Connect,
+			"generateFloatVectors":  GenerateFloatVectors,
+			"generateSparseVectors": GenerateSparseVectors,
 		},
 	}}
 }
@@ -83,6 +84,41 @@ func GenerateFloatVectors(count int, dim int, seed int64) [][]float32 {
 		vectors[i] = row
 	}
 	return vectors
+}
+
+func GenerateSparseVectors(count int, dim int, nnz int, seed int64) ([]entity.SparseEmbedding, error) {
+	if dim <= 0 {
+		return nil, errors.New("sparse vector dimension must be > 0")
+	}
+	if nnz <= 0 {
+		return nil, errors.New("sparse vector nnz must be > 0")
+	}
+	if nnz > dim {
+		return nil, fmt.Errorf("sparse vector nnz %d must be <= dimension %d", nnz, dim)
+	}
+
+	r := rand.New(rand.NewSource(seed))
+	vectors := make([]entity.SparseEmbedding, count)
+	for i := range vectors {
+		seen := make(map[uint32]struct{}, nnz)
+		positions := make([]uint32, 0, nnz)
+		values := make([]float32, nnz)
+		for len(positions) < nnz {
+			pos := uint32(r.Intn(dim))
+			if _, ok := seen[pos]; ok {
+				continue
+			}
+			seen[pos] = struct{}{}
+			positions = append(positions, pos)
+			values[len(positions)-1] = r.Float32()
+		}
+		vector, err := entity.NewSliceSparseEmbedding(positions, values)
+		if err != nil {
+			return nil, err
+		}
+		vectors[i] = vector
+	}
+	return vectors, nil
 }
 
 type Client struct {
@@ -582,6 +618,12 @@ func buildGeneratedColumn(count int, spec map[string]interface{}) (column.Column
 			return nil, err
 		}
 		return column.NewColumnFloatVector(name, requiredInt(spec, "dimension"), values), nil
+	case "sparsefloatvector", "sparse_float_vector", "sparse_vector", "sparse":
+		values, err := generateSparseVectorValues(count, spec, generator)
+		if err != nil {
+			return nil, err
+		}
+		return column.NewColumnSparseVectors(name, values), nil
 	default:
 		return nil, fmt.Errorf("generated column %s: unsupported type %q", name, fieldType)
 	}
@@ -716,6 +758,28 @@ func generateStringValues(count int, spec map[string]interface{}, generator stri
 			values[i] = fmt.Sprintf("%s%d", prefix, start+i*step)
 		}
 		return values, nil
+	case "random_string", "random_text":
+		prefix := getString(spec, "prefix", "")
+		length := getInt(spec, "length", 16)
+		if length < 0 {
+			return nil, errors.New("random_string length must be >= 0")
+		}
+		charset := getString(spec, "charset", "abcdefghijklmnopqrstuvwxyz0123456789")
+		if charset == "" && length > 0 {
+			return nil, errors.New("random_string charset must not be empty when length > 0")
+		}
+		r := rand.New(rand.NewSource(int64(getInt(spec, "seed", 1))))
+		values := make([]string, count)
+		for i := range values {
+			var b strings.Builder
+			b.Grow(len(prefix) + length)
+			b.WriteString(prefix)
+			for j := 0; j < length; j++ {
+				b.WriteByte(charset[r.Intn(len(charset))])
+			}
+			values[i] = b.String()
+		}
+		return values, nil
 	default:
 		return nil, fmt.Errorf("unsupported string generator %q", generator)
 	}
@@ -784,6 +848,29 @@ func generateFloatVectorValues(count int, spec map[string]interface{}, generator
 	}
 }
 
+func generateSparseVectorValues(count int, spec map[string]interface{}, generator string) ([]entity.SparseEmbedding, error) {
+	switch generator {
+	case "random_sparse_vector", "random_sparse", "random":
+		return GenerateSparseVectors(count, requiredInt(spec, "dimension"), requiredInt(spec, "nnz"), int64(getInt(spec, "seed", 1)))
+	case "constant":
+		rawVector, ok := spec["value"]
+		if !ok {
+			return nil, errors.New("constant sparse vector generator requires value")
+		}
+		vector, err := toSparseVector(rawVector)
+		if err != nil {
+			return nil, err
+		}
+		values := make([]entity.SparseEmbedding, count)
+		for i := range values {
+			values[i] = vector
+		}
+		return values, nil
+	default:
+		return nil, fmt.Errorf("unsupported sparse_float_vector generator %q", generator)
+	}
+}
+
 func buildColumn(name string, fieldType string, dim int, value interface{}) (column.Column, error) {
 	switch strings.ToLower(fieldType) {
 	case "int64", "long":
@@ -813,12 +900,41 @@ func buildColumn(name string, fieldType string, dim int, value interface{}) (col
 			dim = len(values[0])
 		}
 		return column.NewColumnFloatVector(name, dim, values), nil
+	case "sparsefloatvector", "sparse_float_vector", "sparse_vector", "sparse":
+		values, err := toSparseVectors(value)
+		if err != nil {
+			return nil, err
+		}
+		return column.NewColumnSparseVectors(name, values), nil
 	default:
 		return nil, fmt.Errorf("unsupported column type %q", fieldType)
 	}
 }
 
 func getVectors(input map[string]interface{}) ([]entity.Vector, error) {
+	vectorType := strings.ToLower(getString(input, "vectorType", getString(input, "type", "")))
+	if isSparseVectorType(vectorType) || input["sparseVectors"] != nil {
+		var values []entity.SparseEmbedding
+		if input["sparseVectors"] != nil {
+			var err error
+			values, err = toSparseVectors(input["sparseVectors"])
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			var err error
+			values, err = GenerateSparseVectors(getInt(input, "nq", 1), requiredInt(input, "dimension"), requiredInt(input, "nnz"), int64(getInt(input, "seed", 1)))
+			if err != nil {
+				return nil, err
+			}
+		}
+		vectors := make([]entity.Vector, 0, len(values))
+		for _, value := range values {
+			vectors = append(vectors, value)
+		}
+		return vectors, nil
+	}
+
 	var values [][]float32
 	if input["vectors"] != nil {
 		var err error
@@ -914,6 +1030,8 @@ func parseFieldType(value string) (entity.FieldType, error) {
 		return entity.FieldTypeJSON, nil
 	case "floatvector", "float_vector", "vector":
 		return entity.FieldTypeFloatVector, nil
+	case "sparsefloatvector", "sparse_float_vector", "sparse_vector", "sparse":
+		return entity.FieldTypeSparseVector, nil
 	default:
 		return entity.FieldTypeNone, fmt.Errorf("unsupported field type %q", value)
 	}
@@ -924,8 +1042,40 @@ func inferColumnType(value interface{}) string {
 		if _, ok := rows[0].([]interface{}); ok {
 			return "floatVector"
 		}
+		if row, ok := rows[0].(map[string]interface{}); ok && looksLikeSparseVector(row) {
+			return "sparseFloatVector"
+		}
 	}
 	return "varchar"
+}
+
+func isSparseVectorType(value string) bool {
+	switch strings.ToLower(value) {
+	case "sparsefloatvector", "sparse_float_vector", "sparse_vector", "sparse":
+		return true
+	default:
+		return false
+	}
+}
+
+func looksLikeSparseVector(row map[string]interface{}) bool {
+	if _, ok := row["values"]; ok {
+		if _, hasIndices := row["indices"]; hasIndices {
+			return true
+		}
+		if _, hasPositions := row["positions"]; hasPositions {
+			return true
+		}
+	}
+	if len(row) == 0 {
+		return false
+	}
+	for key := range row {
+		if _, err := strconv.ParseUint(key, 10, 32); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func int64Range(start int64, count int) []int64 {
@@ -1105,6 +1255,53 @@ func toInt32Slice(value interface{}) ([]int32, error) {
 	return out, nil
 }
 
+func toUint32Slice(value interface{}) ([]uint32, error) {
+	raw, ok := value.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("expected array, got %T", value)
+	}
+	out := make([]uint32, len(raw))
+	for i, item := range raw {
+		parsed, err := toUint32(item)
+		if err != nil {
+			return nil, fmt.Errorf("index %d: %w", i, err)
+		}
+		out[i] = parsed
+	}
+	return out, nil
+}
+
+func toUint32(value interface{}) (uint32, error) {
+	switch v := value.(type) {
+	case int:
+		if v < 0 {
+			return 0, fmt.Errorf("must be >= 0, got %d", v)
+		}
+		return uint32(v), nil
+	case int64:
+		if v < 0 || v > math.MaxUint32 {
+			return 0, fmt.Errorf("out of uint32 range: %d", v)
+		}
+		return uint32(v), nil
+	case float64:
+		if math.Trunc(v) != v {
+			return 0, fmt.Errorf("must be an integer, got %v", v)
+		}
+		if v < 0 || v > float64(math.MaxUint32) {
+			return 0, fmt.Errorf("out of uint32 range: %v", v)
+		}
+		return uint32(v), nil
+	case string:
+		parsed, err := strconv.ParseUint(v, 10, 32)
+		if err != nil {
+			return 0, fmt.Errorf("must be uint32 string: %w", err)
+		}
+		return uint32(parsed), nil
+	default:
+		return 0, fmt.Errorf("must be uint32-compatible, got %T", value)
+	}
+}
+
 func toFloat32Slice(value interface{}) ([]float32, error) {
 	raw, ok := value.([]interface{})
 	if !ok {
@@ -1158,6 +1355,90 @@ func toFloatVectors(value interface{}) ([][]float32, error) {
 	default:
 		return nil, fmt.Errorf("expected vector array, got %T", value)
 	}
+}
+
+func toSparseVectors(value interface{}) ([]entity.SparseEmbedding, error) {
+	switch v := value.(type) {
+	case []entity.SparseEmbedding:
+		return v, nil
+	case []interface{}:
+		out := make([]entity.SparseEmbedding, len(v))
+		for i, row := range v {
+			converted, err := toSparseVector(row)
+			if err != nil {
+				return nil, fmt.Errorf("sparse vector row %d: %w", i, err)
+			}
+			out[i] = converted
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("expected sparse vector array, got %T", value)
+	}
+}
+
+func toSparseVector(value interface{}) (entity.SparseEmbedding, error) {
+	switch v := value.(type) {
+	case entity.SparseEmbedding:
+		return v, nil
+	case map[string]interface{}:
+		if rawValues, ok := v["values"]; ok {
+			rawPositions, ok := v["indices"]
+			if !ok {
+				rawPositions = v["positions"]
+			}
+			if rawPositions == nil {
+				return nil, errors.New("sparse vector object requires indices or positions")
+			}
+			positions, err := toUint32Slice(rawPositions)
+			if err != nil {
+				return nil, err
+			}
+			values, err := toFloat32Slice(rawValues)
+			if err != nil {
+				return nil, err
+			}
+			return newSparseEmbedding(positions, values)
+		}
+		positions := make([]uint32, 0, len(v))
+		values := make([]float32, 0, len(v))
+		for key, rawValue := range v {
+			pos, err := strconv.ParseUint(key, 10, 32)
+			if err != nil {
+				return nil, fmt.Errorf("sparse vector map key %q must be uint32 index", key)
+			}
+			positions = append(positions, uint32(pos))
+			values = append(values, float32(toFloat64(rawValue)))
+		}
+		return newSparseEmbedding(positions, values)
+	case []interface{}:
+		positions := make([]uint32, 0, len(v))
+		values := make([]float32, 0, len(v))
+		for i, rawPair := range v {
+			pair, ok := rawPair.([]interface{})
+			if !ok || len(pair) != 2 {
+				return nil, fmt.Errorf("sparse vector pair %d must be [index, value]", i)
+			}
+			pos, err := toUint32(pair[0])
+			if err != nil {
+				return nil, fmt.Errorf("sparse vector pair %d index: %w", i, err)
+			}
+			positions = append(positions, pos)
+			values = append(values, float32(toFloat64(pair[1])))
+		}
+		return newSparseEmbedding(positions, values)
+	default:
+		return nil, fmt.Errorf("expected sparse vector row, got %T", value)
+	}
+}
+
+func newSparseEmbedding(positions []uint32, values []float32) (entity.SparseEmbedding, error) {
+	if len(positions) == 0 {
+		return nil, errors.New("sparse vector must contain at least one non-zero value")
+	}
+	if len(positions) != len(values) {
+		return nil, fmt.Errorf("sparse vector positions length %d does not match values length %d", len(positions), len(values))
+	}
+	return entity.NewSliceSparseEmbedding(positions, values)
 }
 
 func toJSONBytes(value interface{}) ([][]byte, error) {

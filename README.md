@@ -79,9 +79,29 @@ c.insertGenerated({
 });
 ```
 
+Sparse vector generated insert:
+
+```js
+c.insertGenerated({
+  collection: 'sparse_test',
+  count: 1000,
+  returnIDs: false,
+  columns: [
+    { name: 'id', type: 'int64', generator: 'sequence', start: '1000000' },
+    { name: 'tenant', type: 'varchar', generator: 'random_string', prefix: 'k6-', length: 12, seed: 2 },
+    { name: 'sparse', type: 'sparse_float_vector', dimension: 100000, nnz: 200, generator: 'random_sparse_vector', seed: 5 },
+  ],
+});
+```
+
 Supported generated types: `int64`, `int32`, `float`, `double`, `varchar`, `json`,
-and `float_vector`. Supported generators: `sequence`, `constant`, `random_int`,
-`random_float`, `random_json`, and `random_vector`.
+`float_vector`, and `sparse_float_vector`. Supported generators: `sequence`,
+`constant`, `random_int`, `random_float`, `random_string`, `random_text`,
+`random_json`, `random_vector`, and `random_sparse_vector`.
+
+For regular `insert()`, sparse rows can be passed as `{ indices, values }`,
+`{ positions, values }`, numeric-key maps such as `{ "10": 0.4, "99": 0.7 }`,
+or `[index, value]` pair arrays.
 
 `insertGenerated()` returns `{ count }` by default. Set `returnIDs: true` only when
 you need generated primary keys back in JS; for load tests this avoids copying large

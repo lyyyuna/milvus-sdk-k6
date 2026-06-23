@@ -1,4 +1,5 @@
 k6
+k6-*
 *.test
 dist/
 tmp/
